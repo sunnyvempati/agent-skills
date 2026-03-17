@@ -1,131 +1,141 @@
 # immunefi-hunter
 
-Autonomous smart contract vulnerability scanner for Immunefi bug bounties. Fetches active bounty programs, pulls contract source, runs static analysis + pattern matching, and generates Immunefi-format reports for findings.
+Autonomous smart contract vulnerability hunter for Immunefi bug bounties. Combines computational attack path exploration with LLM-driven reasoning to find bugs that tools and manual auditors miss.
 
-Requires: `slither-analyzer`, `solc-select`, `foundry` (forge/anvil/cast), `requests`.
+**Philosophy:** Tools find patterns. Auditors find logic bugs. This finds what happens when you *actually execute* thousands of attack paths against live state and let the results tell you where the bugs are.
 
-## Quick Start
+## What Makes This Different
 
-```sh
-# Scan a specific contract
-python hunter.py scan 0x1234...abcd --chain ethereum
+Most audit tools are pattern matchers (Slither, Mythril) or reasoning frameworks (Nemesis, manual audit). This is neither — it's **empirical attack simulation**.
 
-# Scan an Immunefi bounty program by slug  
-python hunter.py bounty "uniswap" --depth full
+### 1. Attack Path Autoresearch
+The core differentiator. Instead of asking "could this be vulnerable?", we ask "what happens when we try every possible attack sequence?"
 
-# List active Immunefi programs sorted by max bounty
-python hunter.py programs --sort bounty --min-bounty 50000
-
-# Run full pipeline: fetch programs → filter → scan → report
-python hunter.py sweep --min-bounty 10000 --max-age-days 30
-
-# Check findings log
-python hunter.py findings --severity critical,high
-
-# Generate Immunefi report for a finding
-python hunter.py report <finding-id> --format immunefi
 ```
+For each target contract:
+  1. Extract all external/public functions
+  2. Generate permutations of call sequences (2-5 calls deep)
+  3. For each sequence:
+     - Fork mainnet state via anvil
+     - Execute the sequence with adversarial parameters
+     - Check invariants: did balances change unexpectedly?
+       Did access controls hold? Did state become inconsistent?
+  4. Score each sequence by "suspicion" — unexpected state changes,
+     reverts at wrong points, profit opportunities
+  5. Feed high-scoring sequences back as seeds for deeper exploration
+  6. Iterate until convergence (no new suspicious paths found)
+```
+
+This is autoresearch applied to security: systematic exploration with feedback loops.
+
+### 2. Economic Invariant Testing
+Not "does this revert?" but "can someone profit from this?"
+
+```python
+# For every external function combination:
+attacker_balance_before = get_balance(attacker)
+execute_attack_sequence(sequence)
+attacker_balance_after = get_balance(attacker)
+
+if attacker_balance_after > attacker_balance_before:
+    flag_as_exploit(sequence, profit=delta)
+```
+
+Flash loan wrappers, multi-block MEV sequences, governance manipulation — tested empirically against real state.
+
+### 3. Cross-Contract Interaction Analysis
+Most bugs aren't in one contract. They're in the *space between* contracts.
+
+- Map all external calls and their targets
+- For protocols with multiple contracts: test invariants across the full system
+- Composability attacks: what happens when Contract A's callback interacts with Contract B's state?
+- Permission boundaries: can contract A trick contract B into acting on its behalf?
+
+### 4. Differential Analysis
+Compare contract behavior across versions, forks, or upgrade proposals.
+
+- Pull both versions of a contract (pre/post upgrade)
+- Run identical call sequences against both
+- Flag any behavioral differences — especially around edge cases
+- Catches storage collision bugs, initialization gaps, and subtle logic changes
+
+### 5. Historical Exploit Pattern Learning
+Train on real exploits, not theoretical patterns.
+
+- Maintain a database of past DeFi exploits (Rekt, DeFi Llama, Immunefi disclosures)
+- Extract attack *signatures* — not code patterns, but behavioral patterns
+- "This contract's oracle usage matches the pattern from the Euler exploit"
+- Continuously updated as new exploits are disclosed
 
 ## Commands
 
-### `programs` — List Active Bounefi Programs
 ```sh
-python hunter.py programs [--sort bounty|date|assets] [--min-bounty N] [--chain ethereum|bsc|polygon|arbitrum|all]
+# Explore a specific contract — full pipeline
+python hunter.py explore 0x1234...abcd --chain ethereum
+
+# Autonomous sweep — hunt across Immunefi programs
+python hunter.py sweep --min-bounty 50000 --hours 4
+
+# Attack path search on a local project
+python hunter.py fuzz ./contracts/ --depth 4 --iterations 1000
+
+# Differential analysis between two contract versions
+python hunter.py diff 0xOLD...addr 0xNEW...addr --chain ethereum
+
+# Economic invariant check
+python hunter.py profit-check 0x1234...abcd --flash-loan --chain ethereum
+
+# List findings
+python hunter.py findings --severity critical,high
+
+# Generate Immunefi-format report
+python hunter.py report <finding-id>
 ```
-Fetches active programs from Immunefi API. Filters by bounty size, chain, and recency. Caches locally to avoid rate limits.
-
-### `scan` — Analyze a Contract
-```sh
-python hunter.py scan <address> --chain <chain> [--depth quick|standard|full]
-```
-Depths:
-- `quick` — Slither only, pattern matching against known vulns (~30s)
-- `standard` — Slither + custom detectors + cross-function analysis (~2min)
-- `full` — All above + forge fuzzing + anvil fork state checks (~10min)
-
-### `bounty` — Scan an Immunefi Program
-```sh
-python hunter.py bounty <slug> [--depth standard] [--scope all|contracts|vaults]
-```
-Pulls all in-scope contracts for a bounty program and runs scans on each.
-
-### `sweep` — Autonomous Hunting Pipeline
-```sh
-python hunter.py sweep [--min-bounty 10000] [--max-age-days 30] [--chains ethereum,arbitrum] [--hours 4]
-```
-The main autonomous loop:
-1. Fetches active Immunefi programs matching filters
-2. Prioritizes by: bounty_size × code_freshness × (1/audit_count)
-3. Pulls contract source (Etherscan/Sourcify/GitHub)
-4. Runs tiered analysis (quick → standard → full on flagged contracts)
-5. Logs all findings to local DB
-6. Generates reports for high-severity findings
-
-### `findings` — View Scan Results
-```sh
-python hunter.py findings [--severity critical,high,medium] [--status new|reported|invalid]
-```
-
-### `report` — Generate Immunefi Report
-```sh
-python hunter.py report <finding-id> [--format immunefi|markdown]
-```
-Generates a properly formatted bug report with:
-- Vulnerability description
-- Impact assessment (funds at risk)
-- Proof of concept (forge test)
-- Recommended fix
-
-## Vulnerability Patterns
-
-Built-in detectors beyond Slither defaults:
-- **Cross-function reentrancy** — state changes after external calls across multiple functions
-- **Oracle manipulation** — spot price dependencies, TWAP window attacks
-- **Flash loan vectors** — large balance assumptions, price impact paths
-- **Precision loss** — division before multiplication, rounding in favor of attacker
-- **Access control gaps** — missing modifiers, admin key risks, proxy upgrade auth
-- **MEV/frontrun vectors** — slippage params, sandwich attack surfaces
-- **Cross-chain bridge logic** — message replay, incomplete validation
-- **Governance attacks** — flash loan voting, timelock bypasses
-- **Token integration issues** — fee-on-transfer, rebasing, non-standard ERC20
-- **Upgradability risks** — storage collisions, uninitialized proxies
 
 ## Architecture
 
 ```
-hunter.py           — CLI entry point + orchestration
-scanners/
-  slither_scan.py   — Slither integration + custom detectors
-  pattern_scan.py   — Regex + AST pattern matching
-  fuzz_scan.py      — Forge-based property fuzzing
-  state_scan.py     — Anvil fork live-state analysis
+hunter.py              — CLI entry point + orchestration
+core/
+  autoresearch.py      — Attack path permutation engine
+  invariants.py        — Economic + state invariant definitions
+  explorer.py          — Anvil fork manager + sequence executor
+  scorer.py            — Suspicion scoring + feedback loop
+analysis/
+  cross_contract.py    — Multi-contract interaction mapping
+  differential.py      — Version diff behavioral analysis
+  exploit_db.py        — Historical exploit pattern database
 fetchers/
-  immunefi.py       — Immunefi API client
-  etherscan.py      — Contract source fetcher (multi-chain)
-  sourcify.py       — Sourcify fallback
+  immunefi.py          — Program discovery + asset enumeration
+  etherscan.py         — Multi-chain source fetcher
+  sourcify.py          — Sourcify fallback
 reporters/
-  immunefi_fmt.py   — Immunefi report template
-  markdown_fmt.py   — Generic markdown report
-data/
-  findings.db       — SQLite findings database
-  programs.json     — Cached Immunefi programs
-  scanned.json      — Scan history (avoid re-scanning)
+  immunefi_fmt.py      — Immunefi report template
+  findings_db.py       — SQLite findings + scan tracking
 ```
 
-## Cron Integration
+## How Autoresearch Applies
 
-```sh
-# Daily sweep — 4 hours of autonomous scanning
-python hunter.py sweep --min-bounty 10000 --hours 4
+The same principle that powers our prediction models:
 
-# Weekly fresh program check
-python hunter.py programs --sort date --min-bounty 5000
-```
+1. **Generate hypotheses** — permute function call sequences
+2. **Test empirically** — execute against forked state
+3. **Score results** — did invariants break? did the attacker profit?
+4. **Feedback loop** — high-scoring sequences seed deeper exploration
+5. **Converge** — stop when no new suspicious paths emerge
+
+In prediction markets, this finds edges. In security, this finds exploits. The methodology is identical — exhaustive search with empirical validation.
+
+## Requirements
+
+- Python 3.11+
+- foundry (forge/anvil/cast)
+- slither-analyzer (for initial recon/AST parsing)
+- Etherscan API keys (free tier works, multi-chain)
 
 ## Notes
 
-- Respects Etherscan rate limits (5 req/s free tier, uses API key if available)
-- Findings DB prevents duplicate reports
-- All PoCs use forge test framework — reproducible and verifiable
-- Never submits reports automatically — human review required before submission
-- Prioritizes programs with NO prior audits or recent code changes (highest alpha)
+- Never submits reports automatically — human review required
+- All findings include reproducible forge test PoCs
+- Respects rate limits on all APIs
+- Findings database prevents duplicate work across sessions
